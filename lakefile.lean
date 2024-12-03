@@ -10,3 +10,6 @@ lean_lib «Luatable» where
 @[default_target]
 lean_exe "luatable" where
   root := `Main
+
+require mathlib from git
+  "https://github.com/leanprover-community/mathlib4"
