@@ -1,18 +1,12 @@
-import Mathlib.Data.Vector.Basic
-
-abbrev TBoolean := Bool
-abbrev TNumber := UInt64 -- Using this for now becuse Float is very cumbersome to use
-
-structure TString where
-  hash : Nat
-  size : Nat
+axiom Float.isInt : Float → Bool
 
 inductive TObject where
-  | string (str: TString)
-  | number (n: TNumber) -- Up to Lua 5.2, Lua exclusively used doubles for numbers
   | nil
-  | bool (b: TBoolean)
-  | light_user_value (pointer: USize)
+  | boolean (b: Bool)
+  | lightUserData (pointer: USize)
+  | number (n: Float) -- Before Lua 5.2, Lua exclusively used doubles for numbers
+  | string (hashVal size: Nat)
+  | collectible (gcObj : USize)
 
 structure Node where
   key: TObject
@@ -20,18 +14,19 @@ structure Node where
 
 structure Table where
   limit : Nat
-  array : List TValue
+  array : List TObject
   node : List Node
   metatable: Table
 
 def maxBits := 24
 def tooBig (x : UInt32) : Bool := (x - 1) >>> maxBits.toUInt32 ≠ 0
 
-def TNumber.nthByte (x i : TNumber) : TNumber :=
+def UInt64.nthByte (x i : UInt64) : UInt64 :=
   x <<< i &&& 0xff
 
-def TNumber.memcpy (x: TNumber) : List UInt8 :=
-  List.range' 0 8 8 |>.map Nat.toUInt64 |>.map x.nthByte |>.map UInt64.toUInt8
+noncomputable def Float.accumulate (x: Float) : List UInt8 :=
+  let castedX := x.toBits
+  List.range' 0 8 8 |>.map Nat.toUInt64 |>.map castedX.nthByte |>.map UInt64.toUInt8
 
 def lmod (s size : Nat) := s &&& (size - 1)
 
@@ -43,10 +38,9 @@ namespace Table
 def lsizenode (t : Table) : Nat := t.node.length.log2
 def sizenode (t : Table) : Nat := 2 ^ t.lsizenode
 
-
-def hashpow2 (t: Table) (n: Nat) (node_exists : t.node.length > 0) : Node :=
-  t.node[lmod n t.sizenode]'
-  (by
+def hashpow2' (t: Table) (nodeExists : t.node.length > 0) (n: Nat) : Fin t.node.length :=
+  ⟨lmod n t.sizenode,
+   by
     rw[lmod, sizenode, lsizenode]
     simp
     calc
@@ -55,50 +49,96 @@ def hashpow2 (t: Table) (n: Nat) (node_exists : t.node.length > 0) : Node :=
         exact Nat.two_pow_pos t.node.length.log2
       _ ≤ t.node.length := by
         apply Nat.log2_self_le
-        exact Nat.not_eq_zero_of_lt node_exists)
+        exact Nat.not_eq_zero_of_lt nodeExists⟩
 
-def hashmod (t: Table) (n: Nat) (node_exists : t.node.length > 0): Node :=
-  t.node[n % ((t.sizenode - 1) ||| 1)]'
-  (by
+def hashpow2 (t: Table)  (nodeExists : t.node.length > 0) (n: Nat) : Node :=
+  t.node[t.hashpow2' nodeExists n]
+
+def hashmod' (t: Table) (nodeExists : t.node.length > 0) (n: Nat) : Fin t.node.length :=
+  ⟨n % ((t.sizenode - 1) ||| 1),
+   by
     have h : t.sizenode - 1 ||| 1 < t.node.length := by
       sorry
     calc
       n % (t.sizenode - 1 ||| 1) < t.sizenode - 1 ||| 1 := by
         apply n.mod_lt
         exact Nat.or_one_pos (t.sizenode - 1)
-      _ < t.node.length := h)
+      _ < t.node.length := h⟩
 
-class Hashable (α : Type) where
-  hashnode (val : α) (t : Table) (node_exists : t.node.length > 0) : Node
+def hashmod (t: Table) (nodeExists : t.node.length > 0) (n: Nat) : Node :=
+  t.node[t.hashmod' nodeExists n]
 
-instance : Hashable TString where
-  hashnode := λ str t ex ↦ t.hashpow2 str.hash ex
+def hashpointer (t: Table) (nodeExists : t.node.length > 0) (p: USize) : Node :=
+  t.hashmod nodeExists p.toNat
 
-instance : Hashable TNumber where
-  hashnode := λ n t ex ↦  t.hashmod (n + 1).memcpy.sum.toNat ex
+def hashstring' (t: Table) (nodeExists: t.node.length > 0) : Nat → Fin t.node.length :=
+  t.hashpow2' nodeExists
 
-instance : Hashable TBoolean where
-  hashnode := λ b t ex ↦ t.hashpow2 b.toNat ex
+def hashstring (t: Table) (nodeExists: t.node.length > 0) : Nat → Node :=
+  t.hashpow2 nodeExists
 
-instance : Hashable USize where
-  hashnode := λ p t ex ↦ t.hashmod p.toUInt32.toNat ex
+noncomputable def hashnum' (t: Table) (nodeExists: t.node.length > 0) (n: Float) : Fin t.node.length :=
+  t.hashmod' nodeExists (n + 1).accumulate.sum.toNat
 
-def mainPosition (t : Table) (key : TObject) : Node :=
-  match key with
-  | TObject.string str => Hashable.hashnode str t sorry
-  | TObject.number n => Hashable.hashnode n t sorry
-  | TObject.bool b => Hashable.hashnode b t sorry
-  | TObject.light_user_value p => Hashable.hashnode p t sorry
-  | _ => sorry
+noncomputable def hashnum (t: Table) (nodeExists: t.node.length > 0) (n: Float) : Node :=
+  t.hashmod nodeExists (n + 1).accumulate.sum.toNat
 
-def arrayIndex (key: TObject) : Option UInt32 :=
-  match key with
+
+def hash (t: Table) (nodeExists : t.node.length > 0) : TObject → Node
+  | TObject.string hv size => t.hashstring nodeExists hv
+  | TObject.number n => t.hashnum nodeExists n
+  | TObject.nil => sorry
+  | TObject.boolean b => t.hashpow2 nodeExists b.toNat
+  | TObject.lightUserData p => t.hashpointer nodeExists p
+  | TObject.collectible gc => t.hashpointer nodeExists gc
+
+noncomputable def mainPosition (t : Table) : TObject → Node := t.hash sorry
+
+def arrayIndex (n: Float) : Option UInt32 :=
+  let rounded := n.toUInt32
+  if rounded >= 1 ∧ ¬tooBig rounded then
+    some rounded
+  else
+    none
+
+def index (t: Table) : TObject → Option UInt32
+  | TObject.nil => none
   | TObject.number n =>
-    let rounded := n.toUInt32
-    if rounded >= 1 ∧ ¬tooBig rounded then
-      some rounded
+    arrayIndex n |>.bind λ i ↦
+    if i ≥ 0 ∧ i.toNat ≤ t.array.length then
+      some (i - 1)
     else
       none
-  | _ => none
+  | key => none
+
+def get (t: Table) : TObject → TObject
+  | TObject.string hv size =>
+    let startIdx := t.hashstring' sorry hv
+    let startNode := t.hashstring sorry hv
+    let found := (t.node.drop startIdx).find? λ n ↦
+      match n.key with
+      | TObject.string hashVal _ => hashVal = hv
+      | _ => false
+    match found with
+    | some n => n.val
+    | none => TObject.nil
+  | TObject.number n =>
+    if n.isInt then
+      if 1 ≤ n ∧ n.toNat ≤ t.array.length then
+        t.array[n - 1]
+      else
+        let startIdx := t.hashnum' sorry n
+        let startNode := t.hashnum sorry n
+        let found := (t.node.drop startIdx).find? λ n ↦
+          match n.key with
+          | TObject.number nv => nv = hv
+          | _ => false
+        match found with
+        | some n => n.val
+        | none => TObject.nil
+    else
+      sorry
+  | default => sorry
+
 
 end Table
